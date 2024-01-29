@@ -253,6 +253,9 @@ static cl::opt<bool> OrderFrameObjects("aarch64-order-frame-objects",
                                        cl::desc("sort stack allocations"),
                                        cl::init(true), cl::Hidden);
 
+static cl::opt<bool> GoFrame("go-frame",
+                             cl::desc("Emit Go compatible frames"));
+
 cl::opt<bool> EnableHomogeneousPrologEpilog(
     "homogeneous-prolog-epilog", cl::Hidden,
     cl::desc("Emit homogeneous prologue and epilogue for the size "
@@ -310,6 +313,8 @@ bool AArch64FrameLowering::homogeneousPrologEpilog(
   if (ReverseCSRRestoreSeq)
     return false;
   if (EnableRedZone)
+    return false;
+  if (GoFrame)
     return false;
 
   // TODO: Window is supported yet.
@@ -422,6 +427,8 @@ static StackOffset getSVEStackSize(const MachineFunction &MF) {
 bool AArch64FrameLowering::canUseRedZone(const MachineFunction &MF) const {
   if (!EnableRedZone)
     return false;
+  if (GoFrame)
+    return false;
 
   // Don't use the red zone if the function explicitly asks us not to.
   // This is typically used for kernel code.
@@ -444,6 +451,10 @@ bool AArch64FrameLowering::canUseRedZone(const MachineFunction &MF) const {
 bool AArch64FrameLowering::hasFP(const MachineFunction &MF) const {
   const MachineFrameInfo &MFI = MF.getFrameInfo();
   const TargetRegisterInfo *RegInfo = MF.getSubtarget().getRegisterInfo();
+
+  // Go frames always require frame pointers.
+  if (GoFrame)
+    return true;
 
   // Win64 EH requires a frame pointer if funclets are present, as the locals
   // are accessed off the frame pointer in both the parent function and the
@@ -1089,6 +1100,9 @@ bool AArch64FrameLowering::shouldCombineCSRLocalStackBump(
   const MachineFrameInfo &MFI = MF.getFrameInfo();
   const AArch64Subtarget &Subtarget = MF.getSubtarget<AArch64Subtarget>();
   const AArch64RegisterInfo *RegInfo = Subtarget.getRegisterInfo();
+  if (GoFrame)
+    return true;
+
   if (homogeneousPrologEpilog(MF))
     return false;
 
@@ -1400,7 +1414,7 @@ static MachineBasicBlock::iterator convertCalleeSaveRestoreToSPPrePostIncDec(
   // update in so create a normal arithmetic instruction instead.
   MachineFunction &MF = *MBB.getParent();
   if (MBBI->getOperand(MBBI->getNumOperands() - 1).getImm() != 0 ||
-      CSStackSizeInc < MinOffset || CSStackSizeInc > MaxOffset) {
+      CSStackSizeInc < MinOffset || CSStackSizeInc > MaxOffset || GoFrame) {
     emitFrameOffset(MBB, MBBI, DL, AArch64::SP, AArch64::SP,
                     StackOffset::getFixed(CSStackSizeInc), TII, FrameFlag,
                     false, false, nullptr, EmitCFI,
@@ -1806,6 +1820,9 @@ void AArch64FrameLowering::emitPrologue(MachineFunction &MF,
   unsigned FixedObject = getFixedObjectSize(MF, AFI, IsWin64, IsFunclet);
 
   auto PrologueSaveSize = AFI->getCalleeSavedStackSize() + FixedObject;
+  if (GoFrame)
+    PrologueSaveSize += 16;
+
   // All of the remaining stack allocations are for locals.
   AFI->setLocalStackSize(NumBytes - PrologueSaveSize);
   bool CombineSPBump = shouldCombineCSRLocalStackBump(MF, NumBytes);
@@ -1842,10 +1859,13 @@ void AArch64FrameLowering::emitPrologue(MachineFunction &MF,
   // For funclets the FP belongs to the containing function.
   if (!IsFunclet && HasFP) {
     // Only set up FP if we actually need to.
-    int64_t FPOffset = AFI->getCalleeSaveBaseToFrameRecordOffset();
+    int64_t FPOffset = -8;
 
-    if (CombineSPBump)
-      FPOffset += AFI->getLocalStackSize();
+    if (!GoFrame) {
+      FPOffset = AFI->getCalleeSaveBaseToFrameRecordOffset();
+      if (CombineSPBump)
+        FPOffset += AFI->getLocalStackSize();
+    }
 
     if (AFI->hasSwiftAsyncContext()) {
       // Before we update the live FP we have to ensure there's a valid (or
@@ -1877,6 +1897,15 @@ void AArch64FrameLowering::emitPrologue(MachineFunction &MF,
       assert(Prolog->getOpcode() == AArch64::HOM_Prolog);
       Prolog->addOperand(MachineOperand::CreateImm(FPOffset));
     } else {
+      // Store a copy of FP & LR at stack top for Go frames.
+      if (GoFrame) {
+        BuildMI(MBB, MBBI, DL, TII->get(AArch64::STPXi))
+          .addDef(AArch64::FP)
+          .addUse(AArch64::LR)
+          .addUse(AArch64::SP)
+          .addImm(NumBytes / 8 - 1)
+          .setMIFlag(MachineInstr::FrameSetup);
+      }
       // Issue    sub fp, sp, FPOffset or
       //          mov fp,sp          when FPOffset is zero.
       // Note: All stores of callee-saved registers are marked as "FrameSetup".
@@ -2942,6 +2971,8 @@ static void computeCalleeSaveRegisterPairs(
         ((!IsWindows && RPI.Reg2 == AArch64::FP) ||
          (IsWindows && RPI.Reg2 == AArch64::LR)))
       Offset += 8;
+    if (GoFrame)
+        Offset += 8;
     RPI.Offset = Offset / Scale;
 
     assert(((!RPI.isScalable() && RPI.Offset >= -64 && RPI.Offset <= 63) ||
@@ -3439,6 +3470,8 @@ bool AArch64FrameLowering::assignCalleeSavedSpillSlots(
     std::vector<CalleeSavedInfo> &CSI, unsigned &MinCSFrameIndex,
     unsigned &MaxCSFrameIndex) const {
   bool NeedsWinCFI = needsWinCFI(MF);
+  MachineFrameInfo &MFI = MF.getFrameInfo();
+
   // To match the canonical windows frame layout, reverse the list of
   // callee saved registers to get them laid out by PrologEpilogInserter
   // in the right order. (PrologEpilogInserter allocates stack objects top
@@ -3447,12 +3480,17 @@ bool AArch64FrameLowering::assignCalleeSavedSpillSlots(
   if (NeedsWinCFI)
     std::reverse(CSI.begin(), CSI.end());
 
+  // Create slots for the duplicated LR & FP.
+  if (GoFrame) {
+    MFI.CreateSpillStackObject(8, Align(8));
+    MFI.CreateFixedSpillStackObject(8, -8);
+  }
+
   if (CSI.empty())
     return true; // Early exit if no callee saved registers are modified!
 
   // Now that we know which registers need to be saved and restored, allocate
   // stack slots for them.
-  MachineFrameInfo &MFI = MF.getFrameInfo();
   auto *AFI = MF.getInfo<AArch64FunctionInfo>();
 
   bool UsesWinAAPCS = isTargetWindows(MF);
